@@ -466,6 +466,19 @@ static size_t get_next_free_block() {
     return block;
 }
 
+/*
+ * Mark a block as newly-freed.
+ * Update superblock free list pointer and FAT accordingly.
+ */
+static void free_block(block_t block) {
+    // Set FAT entry of newly-freed block to point to old start of free list
+    fat_table[block - superblock.s.files_start] = superblock.s.free_list;
+    superblock.s.free_list = block;
+
+    flush_fat();
+    flush_superblock();
+}
+
 static int fuse_fat_mknod(const char *path, mode_t mode, dev_t rdev)
 {
     /* Just a stub.  This method is optional and can safely be left
@@ -572,6 +585,8 @@ static int fuse_fat_unlink(const char *path)
 
 static int fuse_fat_rmdir(const char *path)
 {
+    block_t             start_block;
+    block_t             next_block;
     block_t             block;
     fat_dirent*         dirent;
     int                 first_block;
@@ -589,7 +604,8 @@ static int fuse_fat_rmdir(const char *path)
     /*
      * Make sure it's empty.
      */
-    block = going_dirent->file_start;
+    start_block = going_dirent->file_start;
+    block = start_block;
     first_block = 1;
     while (block != 0) {
         fetch_dirblock(block);
@@ -605,7 +621,7 @@ static int fuse_fat_rmdir(const char *path)
         block = fat_table[block - superblock.s.files_start];
     }
     /*
-     * Remove the directory.  Note that we don't free its space!
+     * Remove the directory.
      */
     fetch_dirblock(going_block);
     memset(going_dirent, 0, sizeof *going_dirent);
@@ -614,6 +630,17 @@ static int fuse_fat_rmdir(const char *path)
      * Write the parent back.
      */
     flush_dirblock();
+
+    /*
+     * Free directory space.
+     */
+    block = start_block;
+    while (block != 0) {
+        next_block = fat_table[block - superblock.s.files_start];
+        free_block(block);
+        block = next_block;
+    }
+
     return 0;
 }
 
