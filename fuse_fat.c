@@ -100,12 +100,14 @@ static fat_dirent*      dirend;         /* End of directory block buffer */
                                   / superblock.s.block_size)
 
 /*
- * Macros to convert a byte offset to a block in a file.
+ * Macro to convert a byte offset to a byte offset in a file.
  */
-#define OFFSET_TO_BLOCK(dirent, x) \
-                                (dirent->file_start + (x) \
-                                  / superblock.s.block_size)
 #define OFFSET_IN_BLOCK(x)      ((x) % superblock.s.block_size)
+
+/*
+ * Macro to find the next block in a linked-list in the FAT
+ */
+#define NEXT_BLOCK(x)           (fat_table[(x) - superblock.s.files_start])
 
 /*
  * Number of directory entries stored in a block.
@@ -300,7 +302,7 @@ static fat_dirent* lookup_component(block_t block,
                 return dirent;
         }
 
-        block = fat_table[block - superblock.s.files_start];
+        block = NEXT_BLOCK(block);
     }
     return NULL;
 }
@@ -447,7 +449,7 @@ static int fuse_fat_readdir(const char *path, void *buf,
             }
         }
 
-        block = fat_table[block - superblock.s.files_start];
+        block = NEXT_BLOCK(block);
     }
 
     return 0;
@@ -461,7 +463,7 @@ static size_t get_next_free_block() {
     block_t             block;
 
     block = superblock.s.free_list;
-    superblock.s.free_list = fat_table[block - superblock.s.files_start];
+    superblock.s.free_list = NEXT_BLOCK(block);
     flush_superblock();
     return block;
 }
@@ -472,7 +474,7 @@ static size_t get_next_free_block() {
  */
 static void free_block(block_t block) {
     // Set FAT entry of newly-freed block to point to old start of free list
-    fat_table[block - superblock.s.files_start] = superblock.s.free_list;
+    NEXT_BLOCK(block) = superblock.s.free_list;
     superblock.s.free_list = block;
 
     flush_fat();
@@ -481,13 +483,61 @@ static void free_block(block_t block) {
 
 static int fuse_fat_mknod(const char *path, mode_t mode, dev_t rdev)
 {
-    /* Just a stub.  This method is optional and can safely be left
-           unimplemented */
-    (void) path;
-    (void) mode;
-    (void) rdev;
+    block_t             block;
+    const char*         cp;
+    fat_dirent*         dirent;
+    block_t             last_block;
+    size_t              len;
+    block_t             parent_block;
 
-    return ENOSYS;
+    if (find_dirent(path, 0) != NULL)
+        return -EEXIST;                 /* Pathname already exists */
+    if (!S_ISREG(mode))
+        return -EACCES;                 /* Only supported for plain files */
+
+    /*
+     * Find the directory to make the new file in.
+     */
+    dirent = find_dirent(path, 1);
+    block = parent_block = dirent->file_start;
+    /*
+     * Find an empty slot.
+     */
+    while (block != 0) {
+        fetch_dirblock(block);
+        for (dirent = dirbuf;  dirent < dirend;  dirent++) {
+            if (dirent->type == TYPE_EMPTY)
+                goto doublebreak;
+        }
+
+        block = NEXT_BLOCK(block);
+    }
+doublebreak:
+    if (block == 0)
+        return -EFBIG;                  /* No room in the directory */
+    dirent->file_start = get_next_free_block();
+    if (dirent->file_start == 0)
+        return -ENOSPC;                 /* No space for new files */
+    dirent->type = TYPE_FILE;
+    dirent->size = 0;
+    cp = strrchr(path, '/');
+    if (cp == NULL)
+        cp = path;
+    else
+        cp++;
+    len = strlen(cp);
+    if (len > NAME_LENGTH)
+        len = NAME_LENGTH;
+    dirent->namelen = len;
+    memcpy(dirent->name, cp, len);
+
+    // Update FAT
+    fat_table[dirent->file_start - superblock.s.files_start] = 0;
+
+    flush_dirblock();
+    flush_fat();
+
+    return 0;
 }
 
 static int fuse_fat_create(const char *path, mode_t mode,
@@ -527,7 +577,7 @@ static int fuse_fat_mkdir(const char *path, mode_t mode)
                 goto doublebreak;
         }
 
-        block = fat_table[block - superblock.s.files_start];
+        block = NEXT_BLOCK(block);
     }
 doublebreak:
     if (block == 0)
@@ -604,8 +654,7 @@ static int fuse_fat_rmdir(const char *path)
     /*
      * Make sure it's empty.
      */
-    start_block = going_dirent->file_start;
-    block = start_block;
+    block = start_block = going_dirent->file_start;
     first_block = 1;
     while (block != 0) {
         fetch_dirblock(block);
@@ -618,7 +667,7 @@ static int fuse_fat_rmdir(const char *path)
         }
         first_block = 0;
 
-        block = fat_table[block - superblock.s.files_start];
+        block = NEXT_BLOCK(block);
     }
     /*
      * Remove the directory.
@@ -636,7 +685,7 @@ static int fuse_fat_rmdir(const char *path)
      */
     block = start_block;
     while (block != 0) {
-        next_block = fat_table[block - superblock.s.files_start];
+        next_block = NEXT_BLOCK(block);
         free_block(block);
         block = next_block;
     }
@@ -666,26 +715,76 @@ static int fuse_fat_truncate(const char *path, off_t size)
 
 static int fuse_fat_open(const char *path, struct fuse_file_info *fi)
 {
-    /* Just a stub.  This method is optional and can safely be left
-        unimplemented */
-    (void) path;
-    (void) fi;
+    fat_dirent*         dirent;
 
-    return -ENOSYS;
+    dirent = find_dirent(path, 0);
+    if (dirent == NULL)
+        return -ENOENT;
+    if (dirent->type != TYPE_FILE)
+        return -EACCES;
+    /*
+     * Open succeeds if the file exists.
+     */
+    return 0;
+}
+
+/*
+ * Given an offset and a starting block, finds the block to read from
+ */
+static size_t offset_to_block(block_t start_block, off_t offset) {
+    block_t             block;
+
+    block = start_block;
+
+    // Iterate through the FAT until we reach our offset
+    for (int block_i = 0; block_i < offset / superblock.s.block_size; block_i++) {
+        // Invalid block
+        if (block == 0) {
+            return 0;
+        }
+
+        block = NEXT_BLOCK(block);   
+    }
+
+    return block;
 }
 
 static int fuse_fat_read(const char *path, char *buf, size_t size,
   off_t offset, struct fuse_file_info *fi)
 {
-    /* Just a stub.  This method is optional and can safely be left
-        unimplemented */
-    (void) path;
-    (void) buf;
-    (void) size;
-    (void) offset;
-    (void) fi;
+    block_t             block;
+    char                blockbuf[BLOCK_SIZE];
+    size_t              bytes_read;
+    fat_dirent*         dirent;
+    size_t              read_size;
 
-    return -ENOSYS;
+    dirent = find_dirent(path, 0);
+    if (dirent == NULL)
+        return -ENOENT;
+    if (dirent->type != TYPE_FILE)
+        return -EACCES;
+
+    read_size = dirent->size;           /* Amount to read (max is file size) */
+    if (offset >= read_size)
+        return 0;
+    if (offset + size > read_size)
+        size = read_size - offset;      /* Don't read past EOF */
+
+    block = offset_to_block(dirent->file_start, offset);
+    offset = OFFSET_IN_BLOCK(offset);
+
+    for (bytes_read = 0;  size > 0;  block = NEXT_BLOCK(block), offset = 0) {
+        read_size = superblock.s.block_size - offset;
+        if (read_size > size)
+            read_size = size;
+        read_block(block, blockbuf);    /* Read in full-block units */
+        memcpy(buf, blockbuf, read_size);
+        bytes_read += read_size;
+        buf += read_size;
+        size -= read_size;
+    }
+
+    return bytes_read;
 }
 
 static int fuse_fat_write(const char *path, const char *buf, size_t size,
