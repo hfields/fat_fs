@@ -459,7 +459,8 @@ static int fuse_fat_readdir(const char *path, void *buf,
  * Get a new file block from the free list.
  * Update superblock free list pointer accordingly.
  */
-static size_t get_next_free_block() {
+static size_t get_next_free_block() 
+{
     block_t             block;
 
     block = superblock.s.free_list;
@@ -472,7 +473,8 @@ static size_t get_next_free_block() {
  * Mark a block as newly-freed.
  * Update superblock free list pointer and FAT accordingly.
  */
-static void free_block(block_t block) {
+static void free_block(block_t block) 
+{
     // Set FAT entry of newly-freed block to point to old start of free list
     NEXT_BLOCK(block) = superblock.s.free_list;
     superblock.s.free_list = block;
@@ -624,13 +626,63 @@ doublebreak:
     return 0;
 }
 
-static int fuse_fat_unlink(const char *path)
+static int fuse_fat_symlink(const char *to, const char *from)
 {
     /* Just a stub.  This method is optional and can safely be left
-        unimplemented */
-    (void) path;
+    unimplemented */
+    (void) to;
+    (void) from;
 
     return -ENOSYS;
+}
+
+static int fuse_fat_readlink(const char *path, char* buf, size_t size)
+{
+    /* Just a stub.  This method is optional and can safely be left
+    unimplemented */
+    (void) path;
+    (void) buf;
+    (void) size;
+
+    return -ENOSYS;
+}
+
+static int fuse_fat_unlink(const char *path)
+{
+    block_t             block;
+    block_t             start_block;
+    block_t             next_block;
+    fat_dirent*         going_dirent;
+
+    /*
+     * Find the file being removed.
+     */
+    going_dirent = find_dirent(path, 0);
+    if (going_dirent == NULL)
+        return -ENOENT;
+
+    start_block = going_dirent->file_start;
+
+    /*
+     * Remove the file by zeroing its directory entry.
+     */
+    memset(going_dirent, 0, sizeof *going_dirent);
+
+    /*
+     * Free file space.
+     */
+    block = start_block;
+    while (block != 0) {
+        next_block = NEXT_BLOCK(block);
+        free_block(block);
+        block = next_block;
+    }
+
+    /*
+     * Write the directory back.
+     */
+    flush_dirblock();
+    return 0;
 }
 
 static int fuse_fat_rmdir(const char *path)
@@ -703,35 +755,11 @@ static int fuse_fat_rename(const char *from, const char *to)
     return -ENOSYS;
 }
 
-static int fuse_fat_truncate(const char *path, off_t size)
-{
-    /* Just a stub.  This method is optional and can safely be left
-        unimplemented */
-    (void) path;
-    (void) size;
-
-    return -ENOSYS;
-}
-
-static int fuse_fat_open(const char *path, struct fuse_file_info *fi)
-{
-    fat_dirent*         dirent;
-
-    dirent = find_dirent(path, 0);
-    if (dirent == NULL)
-        return -ENOENT;
-    if (dirent->type != TYPE_FILE)
-        return -EACCES;
-    /*
-     * Open succeeds if the file exists.
-     */
-    return 0;
-}
-
 /*
- * Given an offset and a starting block, finds the block to read from
+ * Given an offset and a starting block, finds the block the offset is in
  */
-static size_t offset_to_block(block_t start_block, off_t offset) {
+static size_t offset_to_block(block_t start_block, off_t offset) 
+{
     block_t             block;
 
     block = start_block;
@@ -747,6 +775,104 @@ static size_t offset_to_block(block_t start_block, off_t offset) {
     }
 
     return block;
+}
+
+static int fuse_fat_truncate(const char *path, off_t size)
+{
+    block_t             block;
+    block_t             next_block;
+    int                 block_change;
+    char                buffer[BLOCK_SIZE];
+    fat_dirent*         dirent;
+    size_t              oldsize;
+
+    dirent = find_dirent(path, 0);
+    if (dirent == NULL)
+        return -ENOENT;
+    
+    assert(superblock.s.block_size == BLOCK_SIZE);
+    oldsize = dirent->size;
+    block_change = (size / superblock.s.block_size) - (oldsize / superblock.s.block_size);
+
+    /*
+     * If we are extending the file, we need to zero it.
+     */
+    if (size > dirent->size) {
+        // Allocate new blocks as necessary
+        if (block_change > 0) {
+            block = dirent->file_start;
+
+            // Traverse FAT to last block in file
+            while (NEXT_BLOCK(block) != 0) {
+                block = NEXT_BLOCK(block);
+            }
+
+            // Allocate new blocks and update FAT
+            for (int i = 0; i < block_change; i++) {
+                NEXT_BLOCK(block) = get_next_free_block();
+                block = NEXT_BLOCK(block);
+            }
+
+            NEXT_BLOCK(block) = 0;
+            flush_fat();
+        }
+
+        block = offset_to_block(dirent->file_start, oldsize);
+
+        if (OFFSET_IN_BLOCK(oldsize) != 0) {
+            read_block(block, buffer);
+            memset(buffer + OFFSET_IN_BLOCK(oldsize), 0,
+              superblock.s.block_size - OFFSET_IN_BLOCK(oldsize));
+            write_block(block, buffer);
+            oldsize = BLOCKS_TO_BYTES(BYTES_TO_BLOCKS(oldsize));
+        }
+        memset(buffer, 0, superblock.s.block_size);
+        while (oldsize < size) {
+            write_block(block, buffer);
+            oldsize += superblock.s.block_size;
+        }
+    }
+
+    // If we are shortening the file, free space if possible
+    else {
+        if (block_change < 0) {
+            block = dirent->file_start;
+
+            // Traverse FAT to the new last block in the file
+            for (int block_i = 0; block_i < size / superblock.s.block_size; block_i++) {
+                block = NEXT_BLOCK(block);
+            }
+
+            block = NEXT_BLOCK(block);
+            while (block != 0) {
+                next_block = NEXT_BLOCK(block);
+                free_block(block);
+                block = next_block;
+            }
+        }
+    }
+    dirent->size = size;
+
+    /*
+     * Write the parent directory back.
+     */
+    flush_dirblock();
+    return 0;
+}
+
+static int fuse_fat_open(const char *path, struct fuse_file_info *fi)
+{
+    fat_dirent*         dirent;
+
+    dirent = find_dirent(path, 0);
+    if (dirent == NULL)
+        return -ENOENT;
+    if (dirent->type != TYPE_FILE)
+        return -EACCES;
+    /*
+     * Open succeeds if the file exists.
+     */
+    return 0;
 }
 
 static int fuse_fat_read(const char *path, char *buf, size_t size,
@@ -790,15 +916,50 @@ static int fuse_fat_read(const char *path, char *buf, size_t size,
 static int fuse_fat_write(const char *path, const char *buf, size_t size,
   off_t offset, struct fuse_file_info *fi)
 {
-    /* Just a stub.  This method is optional and can safely be left
-        unimplemented */
-    (void) path;
-    (void) buf;
-    (void) size;
-    (void) offset;
-    (void) fi;
+    block_t             block;
+    char                blockbuf[BLOCK_SIZE];
+    size_t              bytes_written;
+    fat_dirent*         dirent;
+    off_t               orig_offset = offset;
+    size_t              write_size;
 
-    return -ENOSYS;
+    dirent = find_dirent(path, 0);
+    if (dirent == NULL)
+        return -ENOENT;
+    if (dirent->type != TYPE_FILE)
+        return -EACCES;
+
+    // Don't write beyond max file size
+    if (size > BLOCKS_PER_FILE * superblock.s.block_size - offset)
+        size = BLOCKS_PER_FILE * superblock.s.block_size - offset;
+
+    if (offset >= BLOCKS_PER_FILE * superblock.s.block_size)
+        return -EFBIG;                          /* File is too big */
+    else if (size == 0)
+        return -EIO;                            /* Empty writes are illegal */
+
+    assert(superblock.s.block_size == BLOCK_SIZE);
+
+    block = offset_to_block(dirent->file_start, offset);
+    offset = OFFSET_IN_BLOCK(offset);
+
+    for (bytes_written = 0;  size > 0;  block = NEXT_BLOCK(block), offset = 0) {
+        if (offset == 0  &&  size >= superblock.s.block_size)
+            read_block(block, blockbuf);        /* Only read if necessary */
+        write_size = size;
+        if (write_size > superblock.s.block_size - offset)
+            write_size = superblock.s.block_size - offset;
+        memcpy(blockbuf + offset, buf, write_size);
+        write_block(block, blockbuf);
+        buf += write_size;
+        size -= write_size;
+        bytes_written += write_size;
+        if (dirent->size < orig_offset + bytes_written)
+            dirent->size = orig_offset + bytes_written;
+    }
+
+    flush_dirblock();
+    return bytes_written;
 }
 
 static int fuse_fat_statfs(const char *path, struct statvfs *stbuf)
@@ -820,6 +981,8 @@ static struct fuse_operations fuse_fat_oper = {
         .mknod          = fuse_fat_mknod,
         .create         = fuse_fat_create,
         .mkdir          = fuse_fat_mkdir,
+        .symlink        = fuse_fat_symlink,
+        .readlink       = fuse_fat_readlink,
         .unlink         = fuse_fat_unlink,
         .rmdir          = fuse_fat_rmdir,
         .rename         = fuse_fat_rename,
