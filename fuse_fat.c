@@ -626,27 +626,6 @@ doublebreak:
     return 0;
 }
 
-static int fuse_fat_symlink(const char *to, const char *from)
-{
-    /* Just a stub.  This method is optional and can safely be left
-    unimplemented */
-    (void) to;
-    (void) from;
-
-    return -ENOSYS;
-}
-
-static int fuse_fat_readlink(const char *path, char* buf, size_t size)
-{
-    /* Just a stub.  This method is optional and can safely be left
-    unimplemented */
-    (void) path;
-    (void) buf;
-    (void) size;
-
-    return -ENOSYS;
-}
-
 static int fuse_fat_unlink(const char *path)
 {
     block_t             block;
@@ -962,14 +941,96 @@ static int fuse_fat_write(const char *path, const char *buf, size_t size,
     return bytes_written;
 }
 
+static int fuse_fat_symlink(const char *to, const char *from)
+{   
+    int                 nod_ret;
+    int                 write_ret;
+    size_t              len;
+    char*               buf;
+
+    // Create file with mknod
+    if (nod_ret = fuse_fat_mknod(from, S_IFREG, 0) != 0) {
+        return nod_ret;
+    }
+
+    len = strlen(to);
+
+    // Write link path to file
+    if (write_ret = fuse_fat_write(from, to, len, 0, NULL) != len) {
+        // Write error
+        if (write_ret < 0)
+            return write_ret;
+        
+        // Bytes written does not match length of to
+        else
+            return -1;
+    }
+
+    return 0;
+}
+
+static int fuse_fat_readlink(const char *path, char* buf, size_t size)
+{
+    block_t             block;
+    char                blockbuf[BLOCK_SIZE];
+    size_t              bytes_read;
+    fat_dirent*         dirent;
+    size_t              read_size;
+
+    dirent = find_dirent(path, 0);
+    if (dirent == NULL)
+        return -ENOENT;
+    if (dirent->type != TYPE_FILE)
+        return -EACCES;
+
+    read_size = dirent->size;           /* Amount to read (max is file size) */
+
+    if (read_size > size)
+        read_size = size;               /* Truncate contents if buffer is too small */
+
+    for (bytes_read = 0;  size > 0;  block = NEXT_BLOCK(block)) {
+        read_size = superblock.s.block_size;
+        if (read_size > size)
+            read_size = size;
+        read_block(block, blockbuf);    /* Read in full-block units */
+        memcpy(buf, blockbuf, read_size);
+        bytes_read += read_size;
+        buf += read_size;
+        size -= read_size;
+    }
+
+    return bytes_read;
+}
+
 static int fuse_fat_statfs(const char *path, struct statvfs *stbuf)
 {
-    /* Just a stub.  This method is optional and can safely be left
-    unimplemented */
-    (void) path;
-    (void) stbuf;
+    block_t                 block;
+    size_t                  free_blocks;
 
-    return -ENOSYS;
+    stbuf->f_bsize = superblock.s.block_size;   /* file system block size */
+    stbuf->f_frsize = superblock.s.block_size;  /* fragment size */
+    stbuf->f_blocks = superblock.s.total_blocks; /* fs size in f_frsize units */
+    stbuf->f_files = 0;                         /* # inodes */
+    stbuf->f_ffree = 0;                         /* # free inodes */
+    stbuf->f_favail = 0;                        /* # free inodes for non-root */
+    stbuf->f_fsid = 0;                          /* file system ID */
+    stbuf->f_flag = 0;                          /* mount flags */
+    stbuf->f_namemax = NAME_LENGTH;             /* max filename length */
+
+    /*
+     * Calculate f_bfree
+     */
+    
+    block = superblock.s.free_list;
+    free_blocks = 0;
+    while (block != 0) {
+        free_blocks++;
+        block = NEXT_BLOCK(block);
+    }
+
+    stbuf->f_bfree = free_blocks;               /* # free blocks */
+    stbuf->f_bavail = stbuf->f_bfree;           /* # free blocks for non-root */
+    return 0;
 }
 
 static struct fuse_operations fuse_fat_oper = {
@@ -981,8 +1042,6 @@ static struct fuse_operations fuse_fat_oper = {
         .mknod          = fuse_fat_mknod,
         .create         = fuse_fat_create,
         .mkdir          = fuse_fat_mkdir,
-        .symlink        = fuse_fat_symlink,
-        .readlink       = fuse_fat_readlink,
         .unlink         = fuse_fat_unlink,
         .rmdir          = fuse_fat_rmdir,
         .rename         = fuse_fat_rename,
@@ -990,6 +1049,8 @@ static struct fuse_operations fuse_fat_oper = {
         .open           = fuse_fat_open,
         .read           = fuse_fat_read,
         .write          = fuse_fat_write,
+        .symlink        = fuse_fat_symlink,
+        .readlink       = fuse_fat_readlink,
         .statfs         = fuse_fat_statfs,
 };
 
